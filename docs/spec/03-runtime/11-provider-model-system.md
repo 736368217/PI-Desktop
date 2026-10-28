@@ -127,9 +127,18 @@ Non-official DeepSeek endpoints also set `requiresNonEmptyReasoningReplay` so
 missing reasoning is filled with a documented placeholder instead of `""`
 (OpenCode / third-party relays reject empty echoes after compaction; see
 ADR 0256 / #296). Official `deepseek.com` rows keep empty-string fill (#223).
-Both official and relay rows set `supportsReasoningEffort: false`; DeepSeek
-does not accept the generic OpenAI `reasoning_effort` request field even when
-thinking is enabled. The overlay does not change `thinkingFormat`.
+Every replayed assistant row carries one reasoning field, named after the
+newest row with real reasoning; real reasoning under another name is moved to
+it, so only rows with no reasoning are filled, and a leading echo of the
+placeholder in stored thinking is neither shown nor replayed (D677, #1945).
+Relay rows set `supportsReasoningEffort: false` because DeepSeek-family relays
+were reported rejecting the generic OpenAI `reasoning_effort` field (#1664).
+Official `deepseek.com` rows leave the flag to pi-ai, which sends
+`reasoning_effort` (low / high / max) next to `thinking: {type: "enabled"}` as
+DeepSeek documents, so the selected thinking level reaches the wire (#1821,
+D672). An explicit per-model `supportsReasoningEffort` selection (`send` or
+`omit`) still overrides this automatic rule on either kind of row. The overlay
+does not change `thinkingFormat`.
 
 Anthropic Messages requests set `forceAdaptiveThinking: true` when the
 models.dev record publishes a reasoning `effort` option and no

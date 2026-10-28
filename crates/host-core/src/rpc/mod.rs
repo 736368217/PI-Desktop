@@ -1,4 +1,5 @@
 mod config_sync_rpc;
+mod gen_ui;
 mod plugin_reviews_rpc;
 mod remote_tools;
 mod scheduled_rpc;
@@ -9,6 +10,8 @@ mod worktree_rpc;
 
 #[cfg(test)]
 mod plugin_reviews_rpc_tests;
+#[cfg(test)]
+mod visualization_tests;
 
 use std::io::{self, BufRead, BufReader as StdBufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -38,7 +41,8 @@ use crate::state::{AppState, HOST_VERSION, PROTOCOL_VERSION};
 use crate::tools::{self, ToolsExecuteParams};
 use crate::transcripts::{self, CompactionRecord};
 use crate::turn_queue;
-use crate::workspace;
+use crate::visualizations;
+use crate::workspace::{self, ContainedRoots, ToolRoot};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -75,6 +79,8 @@ struct JsonRpcNotification {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheModelsParams {
+    #[serde(default)]
+    complete: bool,
     provider_id: String,
     models: Vec<DiscoveredModelInput>,
 }
@@ -780,8 +786,15 @@ fn permission_parent_param(params: &Value) -> Result<Option<String>, JsonRpcErro
 /// Drop the per-session files and caches that live outside SQLite. Shared by
 /// `session.delete` and `projects.remove` so removing a project cleans up
 /// exactly the same side data as deleting one session.
+///
+/// Background tasks belong here too: a deleted session must not leave its
+/// servers and watchers running, and this is the one place every deletion path
+/// already goes through. The stop is a signal only — the supervisor kills and
+/// reaps — so deletion neither blocks on a task settling nor fails with it.
 fn drop_session_side_data(st: &AppState, id: &str) {
+    st.background_tasks.stop_session_running(id);
     scratch::remove_session_dir(&st.data_dir, id);
+    visualizations::remove_session_dir(&st.data_dir, id);
     review::remove_session(&st.data_dir, id);
     st.hashline.drop_session(id);
 }
@@ -1403,11 +1416,11 @@ fn resolve_tool_workspace_for_call(
 /// Read/search tools are low risk inside their normal roots, but an explicit
 /// path outside both roots is a separate capability. The check is deliberately
 /// based on the same resolver used for execution so `..` and symlink escapes
-/// cannot avoid the permission card. Scratch paths are recognized lexically
-/// before the lazy scratch directory exists.
+/// cannot avoid the permission card. Contained roots (scratch, visualization)
+/// are recognized lexically before their lazy directories exist.
 fn requires_external_path_permission(
     workspace_path: Option<&str>,
-    scratch_path: Option<&Path>,
+    roots: &ContainedRoots,
     tool_name: &str,
     args: &Value,
 ) -> bool {
@@ -1417,16 +1430,66 @@ fn requires_external_path_permission(
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return false;
     };
-    if scratch_path.is_some_and(|root| workspace::lexically_inside(root, path)) {
-        return false;
+    if let Some(root) = roots.lexical_root(path) {
+        return !root.allows_implicit_access();
     }
     let Some(workspace_path) = workspace_path else {
         return false;
     };
     matches!(
-        workspace::resolve_tool_path(Path::new(workspace_path), scratch_path, path),
+        workspace::resolve_tool_path(Path::new(workspace_path), roots, path),
         Err(error) if error == "PATH_OUTSIDE_WORKSPACE"
     )
+}
+
+/// Contained roots of a local session: scratch (D114) then visualization
+/// (D671). Remote-workspace sessions get no visualization root.
+fn local_contained_roots(data_dir: &Path, session_id: &str, remote: bool) -> ContainedRoots {
+    let visualization = if remote {
+        None
+    } else {
+        visualizations::session_dir(data_dir, session_id)
+    };
+    ContainedRoots::scratch_only(scratch::session_dir(data_dir, session_id).as_deref())
+        .with(ToolRoot::Visualization, visualization)
+}
+
+/// Whether a Write/Edit lexically targets one of the session's contained roots
+/// and may skip the permission prompt. Never for remote workspaces or contract
+/// modes (their hard deny is not bypassed).
+fn contained_write_auto_allowed(
+    remote: bool,
+    durable_mode: &str,
+    roots: &ContainedRoots,
+    tool_name: &str,
+    args: &Value,
+) -> bool {
+    !remote
+        && !sessions::is_contract_mode(durable_mode)
+        && matches!(tool_name, "Write" | "Edit")
+        && args
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| roots.lexical_root(path))
+            .is_some_and(|root| root.allows_implicit_access())
+        && edit_move_stays_contained(roots, args)
+}
+
+/// An Edit can carry `MV <dest>`; the prompt may be skipped only when that
+/// destination is inside a contained root too. Unparseable ops never reach
+/// the filesystem, so they do not need a prompt.
+fn edit_move_stays_contained(roots: &ContainedRoots, args: &Value) -> bool {
+    let Some(ops) = args.get("ops").and_then(Value::as_str) else {
+        return true;
+    };
+    let Ok(parsed) = crate::tools::hashline::parse_ops(ops) else {
+        return true;
+    };
+    crate::tools::hashline::mv_dest(&parsed).is_none_or(|dest| {
+        roots
+            .lexical_root(dest)
+            .is_some_and(|root| root.allows_implicit_access())
+    })
 }
 
 /// Plans are owned by the session's persisted project. Unlike the legacy
@@ -1859,6 +1922,7 @@ async fn handle_request(
     }
 
     match method {
+        "visualizations.readFragment" => gen_ui::read_fragment(state, params).await,
         "tools.remoteComplete" | "tools.workspaceExecute" | "tools.workspaceAbort" => {
             remote_tools::handle(state, method, params, tx).await
         }
@@ -2539,9 +2603,13 @@ async fn handle_request(
             let input: CacheModelsParams = serde_json::from_value(params)
                 .map_err(|e| rpc_err(1002, e.to_string(), "INVALID_PARAMS"))?;
             let st = state.lock().await;
-            let cached =
-                providers::cache_discovered_models(&st.db, &input.provider_id, &input.models)
-                    .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+            let cached = providers::cache_discovered_models(
+                &st.db,
+                &input.provider_id,
+                &input.models,
+                input.complete,
+            )
+            .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             let models = providers::list_models(&st.db, Some(&input.provider_id))
                 .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             Ok(json!({ "cached": cached, "models": models }))
@@ -2959,6 +3027,55 @@ async fn handle_request(
                 .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             Ok(json!({ "ok": true }))
         }
+        "session.deleteMessage" | "session.retractPendingPrompt" => {
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
+            let target_key = if method == "session.deleteMessage" {
+                "messageId"
+            } else {
+                "userMessageId"
+            };
+            let target_id = params
+                .get(target_key)
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| rpc_err(1002, format!("{target_key} required"), "INVALID_PARAMS"))?;
+            let turn_id = match params.get("turnId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) if !id.trim().is_empty() => Some(id.as_str()),
+                Some(_) => {
+                    return Err(rpc_err(
+                        1002,
+                        "turnId must be a nonempty string",
+                        "INVALID_PARAMS",
+                    ))
+                }
+            };
+            let st = state.lock().await;
+            let result = if method == "session.deleteMessage" {
+                sessions::delete_message(&st.db, session_id, target_id)
+                    .and_then(|result| Ok(serde_json::to_value(result)?))
+            } else {
+                sessions::retract_pending_prompt(&st.db, session_id, target_id, turn_id)
+                    .and_then(|result| Ok(serde_json::to_value(result)?))
+            };
+            result.map_err(|error| {
+                let message = error.to_string();
+                let code = if message.starts_with("NOT_FOUND") {
+                    "NOT_FOUND"
+                } else if message.starts_with("TURN_RUNNING") {
+                    "TURN_RUNNING"
+                } else if message.starts_with("PERMISSION_DENIED") {
+                    "PERMISSION_DENIED"
+                } else {
+                    "INTERNAL"
+                };
+                rpc_err(if code == "NOT_FOUND" { 1007 } else { 1000 }, message, code)
+            })
+        }
         "session.truncateFrom" => {
             let session_id = params
                 .get("sessionId")
@@ -3069,13 +3186,33 @@ async fn handle_request(
                 serde_json::from_value(params.get("prefix").cloned().unwrap_or_else(|| json!([])))
                     .map_err(|e| rpc_err(1002, e.to_string(), "INVALID_PARAMS"))?;
             let st = state.lock().await;
-            let messages = sessions::activate_message_revision(
-                &st.db,
-                session_id,
-                root_user_id,
-                revision_index,
-                &prefix,
-            )
+            let require_canonical = match params.get("requireCanonicalPrefix") {
+                None => false,
+                Some(Value::Bool(required)) => *required,
+                Some(_) => {
+                    return Err(rpc_err(
+                        1002,
+                        "requireCanonicalPrefix must be a boolean",
+                        "INVALID_PARAMS",
+                    ))
+                }
+            };
+            let messages = if require_canonical {
+                sessions::activate_message_revision_canonical(
+                    &st.db,
+                    session_id,
+                    root_user_id,
+                    revision_index,
+                )
+            } else {
+                sessions::activate_message_revision(
+                    &st.db,
+                    session_id,
+                    root_user_id,
+                    revision_index,
+                    &prefix,
+                )
+            }
             .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             Ok(json!({ "messages": messages }))
         }
@@ -4056,6 +4193,11 @@ async fn handle_request(
                         None => resolve_tool_workspace_for_call(&st, &p.session_id, &p.args)?,
                     };
                     let scratch = scratch::session_dir(&st.data_dir, &p.session_id);
+                    let contained_roots = local_contained_roots(
+                        &st.data_dir,
+                        &p.session_id,
+                        remote_workspace.is_some(),
+                    );
                     let external_path_permission = if remote_workspace.is_some() {
                         remote_tools::requires_external_permission(
                             ws.as_deref(),
@@ -4065,7 +4207,7 @@ async fn handle_request(
                     } else {
                         requires_external_path_permission(
                             ws.as_deref(),
-                            scratch.as_deref(),
+                            &contained_roots,
                             &p.tool_name,
                             &p.args,
                         )
@@ -4084,25 +4226,22 @@ async fn handle_request(
                                 plan_safe_actions: p.plan_safe_actions.as_deref(),
                             },
                         );
-                    // Write/Edit targeting the session scratch dir never touch
-                    // the user's project — skip the prompt (D114). The lexical
-                    // pre-check only decides prompting; execution still goes
-                    // through the symlink-aware resolver, so it cannot be used
-                    // to escape containment. A contract mode's hard deny is
-                    // never bypassed.
-                    if remote_workspace.is_none()
-                        && !sessions::is_contract_mode(&durable_mode)
-                        && auto.is_none()
-                        && matches!(p.tool_name.as_str(), "Write" | "Edit")
+                    // Write/Edit targeting the session scratch dir (D114) or
+                    // visualization dir (D671) never touch the user's project —
+                    // skip the prompt only while those roots remain valid.
+                    // Execution revalidates visualization roots and runs the
+                    // symlink-aware path resolver; root identity is not cached.
+                    // A contract mode's hard deny is never bypassed.
+                    if auto.is_none()
+                        && contained_write_auto_allowed(
+                            remote_workspace.is_some(),
+                            &durable_mode,
+                            &contained_roots,
+                            &p.tool_name,
+                            &p.args,
+                        )
                     {
-                        if let (Some(scratch_dir), Some(path)) = (
-                            scratch.as_deref(),
-                            p.args.get("path").and_then(|v| v.as_str()),
-                        ) {
-                            if workspace::lexically_inside(scratch_dir, path) {
-                                auto = Some(PermissionDecision::AllowOnce);
-                            }
-                        }
+                        auto = Some(PermissionDecision::AllowOnce);
                     }
                     if let Some(decision) = auto {
                         (
@@ -4364,6 +4503,12 @@ async fn handle_request(
                     session_id: p.session_id.as_str(),
                     store: &hashline_store,
                 };
+                // Remote-workspace sessions get no visualization root (D671).
+                let visualization_path = if remote_workspace.is_some() {
+                    None
+                } else {
+                    visualizations::session_dir(&data_dir, &p.session_id)
+                };
                 let pending_review = if remote_workspace.is_some() {
                     None
                 } else {
@@ -4372,7 +4517,7 @@ async fn handle_request(
                         &p.session_id,
                         &p.tool_call_id,
                         ws_path.as_deref(),
-                        scratch_path.as_deref(),
+                        &local_contained_roots(&data_dir, &p.session_id, false),
                         &p.tool_name,
                         &p.args,
                     )
@@ -4489,6 +4634,7 @@ async fn handle_request(
                             bash_options,
                             allow_external_paths: external_path_permission,
                             hashline: Some(hashline_ctx),
+                            visualization_root: visualization_path.as_deref(),
                         },
                     );
                     if matches!(p.tool_name.as_str(), "Read" | "Glob" | "Grep") {
@@ -4702,7 +4848,6 @@ async fn handle_request(
                 .unwrap_or_else(|| "ask".into());
             let args = params.get("args").cloned().unwrap_or_else(|| json!({}));
             let workspace_path = resolve_tool_workspace_for_call(&st, session_id, &args)?;
-            let scratch_path = scratch::session_dir(&st.data_dir, session_id);
             let external_path_permission =
                 if remote_tools::session_remote_workspace(&st, session_id)?.is_some() {
                     remote_tools::requires_external_permission(
@@ -4713,7 +4858,7 @@ async fn handle_request(
                 } else {
                     requires_external_path_permission(
                         workspace_path.as_deref(),
-                        scratch_path.as_deref(),
+                        &local_contained_roots(&st.data_dir, session_id, false),
                         tool_name,
                         &args,
                     )
@@ -5513,6 +5658,101 @@ mod tests {
     use crate::sessions;
     use crate::state::AppState;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn bounded_history_mutation_rpcs_return_only_mutation_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::open(dir.path()).unwrap();
+        app.handshook = true;
+        let session = sessions::create_session(&app.db, None, None, None, None, None).unwrap();
+        let message: sessions::UiMessage = serde_json::from_value(json!({
+            "id": "pending", "role": "user", "content": "hello",
+            "createdAt": "2026-10-26T00:00:00Z"
+        }))
+        .unwrap();
+        let turn = sessions::begin_turn(&app.db, &session.id, None, None).unwrap();
+        sessions::append_message(&app.db, &session.id, &message, Some(&turn)).unwrap();
+        sessions::end_turn(&app.db, &turn, "aborted", None, None, false).unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let tx = mpsc::unbounded_channel().0;
+        let result = handle_request(
+            state.clone(),
+            "session.retractPendingPrompt",
+            json!({
+                "sessionId": session.id, "userMessageId": "pending", "turnId": turn
+            }),
+            tx.clone(),
+        )
+        .await;
+        assert!(result.is_ok(), "bounded retract must exist: {result:?}");
+        assert_eq!(
+            result.unwrap(),
+            json!({"ok": true, "retracted": true, "removedCount": 1})
+        );
+        let deleted = handle_request(
+            state,
+            "session.deleteMessage",
+            json!({
+                "sessionId": session.id, "messageId": "pending"
+            }),
+            tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deleted,
+            json!({"ok": true, "deleted": false, "deletedCount": 0})
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_activation_rpc_rejects_missing_anchor_and_keeps_legacy_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::open(dir.path()).unwrap();
+        app.handshook = true;
+        let session = sessions::create_session(&app.db, None, None, None, None, None).unwrap();
+        let root = json!({"id":"root", "role":"user", "content":"archived", "createdAt":"2026-10-26T00:00:00Z"});
+        let message = serde_json::from_value(root.clone()).unwrap();
+        sessions::save_message_revision(&app.db, &session.id, "root", &[message], false).unwrap();
+        let state = Arc::new(Mutex::new(app));
+        let tx = mpsc::unbounded_channel().0;
+        let strict = handle_request(
+            state.clone(),
+            "session.activateRevision",
+            json!({
+                "sessionId":session.id, "rootUserId":"root", "revisionIndex":1,
+                "requireCanonicalPrefix":true
+            }),
+            tx.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(strict.message.contains("anchor missing"));
+        let prefix = json!({"id":"legacy-prefix", "role":"user", "content":"prefix", "createdAt":"2026-10-26T00:00:00Z"});
+        let legacy = handle_request(
+            state.clone(),
+            "session.activateRevision",
+            json!({
+                "sessionId":session.id, "rootUserId":"root", "revisionIndex":1, "prefix":[prefix]
+            }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy["messages"][0]["id"], "legacy-prefix");
+        let canonical = handle_request(
+            state,
+            "session.activateRevision",
+            json!({
+                "sessionId":session.id, "rootUserId":"root", "revisionIndex":1,
+                "requireCanonicalPrefix":true
+            }),
+            tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(canonical["messages"][0]["id"], "legacy-prefix");
+    }
 
     #[tokio::test]
     async fn builtin_skill_activation_rpc_round_trips() {
@@ -7481,6 +7721,7 @@ mod tests {
                 bash_options: None,
                 allow_external_paths: false,
                 hashline: None,
+                visualization_root: None,
             },
         )
         .await;
@@ -7501,6 +7742,7 @@ mod tests {
                 bash_options: None,
                 allow_external_paths: false,
                 hashline: None,
+                visualization_root: None,
             },
         )
         .await;

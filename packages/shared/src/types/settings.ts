@@ -193,6 +193,16 @@ export type AppSettings = {
    */
   smoothStreaming?: boolean;
   /**
+   * Render inline interactive visualizations in the transcript (ADR
+   * `gen-ui-inline-visualization`). Absent and false keep the feature off: the
+   * system prompt carries no visualization directory, the
+   * `pi-desktop/visualize` skill is withheld from the catalog and the `/` menu,
+   * and an existing `::visualize` reference line is hidden without loading a
+   * card. `true` opts in for local sessions; remote-host sessions stay without
+   * it because their tools write on the remote machine.
+   */
+  inlineVisualizations?: boolean;
+  /**
    * Prevent the display from sleeping while the app is running. Uses
    * Electron's `powerSaveBlocker` with `prevent-display-sleep` on all
    * platforms. Absent and false mean the system manages sleep normally.
@@ -216,6 +226,12 @@ export type AppSettings = {
   sidebarSessionTime?: boolean;
   /** Voice input settings (D-voice-runtime). */
   voice?: VoiceInputSettings;
+  /**
+   * Opt-in radial context menu for the empty transcript background. Absent
+   * keeps the vertical menu; see `RadialMenuPreferences` for the direction
+   * defaults.
+   */
+  radialMenu?: RadialMenuPreferences;
   onboardingDismissed: boolean;
 };
 
@@ -236,3 +252,34 @@ export type VoiceInputSettings = {
 export type LinkOpenTarget = "workpanel" | "external";
 
 export type ContextUsageDisplay = "remaining" | "used";
+
+/**
+ * One action the transcript background radial menu can place on a direction.
+ * `none` leaves that direction empty, so a ring can carry fewer than four
+ * actions without inventing a fifth one.
+ */
+export type RadialMenuAction =
+  | "copy-conversation"
+  | "select-conversation"
+  | "copy-last-answer"
+  | "scroll-top"
+  | "scroll-bottom"
+  | "open-browser"
+  | "open-work-panel"
+  | "open-project-folder"
+  | "none";
+
+export type RadialMenuDirection = "up" | "right" | "down" | "left";
+
+/**
+ * Per-direction placement for the transcript background radial menu.
+ * Absent fields fall back to the released defaults; `enabled` is opt-in, so an
+ * absent object keeps the vertical context menu every existing build ships.
+ */
+export type RadialMenuPreferences = {
+  enabled?: boolean;
+  up?: RadialMenuAction;
+  right?: RadialMenuAction;
+  down?: RadialMenuAction;
+  left?: RadialMenuAction;
+};

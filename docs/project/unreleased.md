@@ -1,6 +1,15 @@
 # Unreleased changes
 
-- Upgrade the Pi agent, model adapters, native-session SDK, and MCP client from
-  1.1.0 to 1.3.0. Preserve Desktop compatibility patches, omit foreign-model
-  thinking from replay, reject malformed final tool JSON before execution, and
-  expose the user-run discriminator to trusted extension startup handlers.
+- Fixed an older regenerated prompt appearing after the latest reply when its
+  branch archive completed outside the loaded history window (#1870). Pager
+  acknowledgements now update existing rows without appending historical roots.
+- Generate inline visualizations faster. The visualization shell now preloads
+  the bundled D3 and a `viz` chart helper layer (container sizing, resize and
+  theme redraw, axes, tick overlap, legends, and a declarative `viz.render`
+  for bar, line, area, point, heatmap, and donut charts), so model-written
+  fragments are shorter. The `visualize` skill asks for a single write
+  followed by the reply instead of reading the file back. Fragments written
+  under the earlier skill keep rendering. When a fragment's script fails, the
+  card now says so and shows the error instead of staying blank, and the
+  model's write result flags syntax errors and missing chart containers so it
+  can fix them with one edit.

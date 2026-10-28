@@ -123,6 +123,12 @@ Outer frame that positions Topbar, Sidebar, MainChat, and WorkPanel. Owns resize
   the message is already loaded but outside the mounted row window, first restore
   the saved absolute scroll offset; the bounded window can then grow as the user
   scrolls toward the anchor.
+  Restored ranges continue automatically near the visible lower boundary, in
+  bounded pages and without a Load later messages button. Appending a page must
+  preserve the viewport; hidden panes must not initiate continuation. Do not
+  merge a disjoint live tail across unread history. Once the range reaches the
+  tail, canonical updates and new live rows resume without prepending older
+  cached rows. Explicit search retains its separate manual paging behavior.
   Explicit disclosure choices and the mounted-window budget survive eviction;
   bookmarks do not persist across renderer/app restarts.
 - A pane renders the store's live `messages` while its session is the active one
@@ -917,12 +923,18 @@ thinking never creates an empty wrapper. All three modes render exactly one
 top-level process disclosure and change neither what a tool received nor what is
 stored.
 
-The ordinary group owning the active execution segment stays open while its turn
-is active. Afterward, ordinary groups with at most four visible items remain open;
-larger groups start closed, while Task topology groups remain open. These defaults
-are unified across modes and do not depend on the thinking preference. Explicit
-user choices remain authoritative. Group headers summarize count, running state
-and issue count without treating a failed child as a failed turn.
+Every ordinary group of a turn stays open while that turn is active, whether or
+not it still owns the live execution segment, so work never folds away mid-run.
+After the turn settles, ordinary groups with at most four visible items remain
+open, larger groups start closed, and Task topology groups remain open. A group
+that still renders a Thinking row also remains open: with `Show thinking` on the
+reasoning is content the reader asked to see, and folding the group around it
+would make the setting look broken. These defaults are unified across modes and
+otherwise do not depend on the thinking preference. Explicit user choices remain
+authoritative. Group headers summarize count, running state and issue count
+without treating a failed child as a failed turn; the issue counter is one inline
+non-wrapping chip whose icon and localized count share a centred line and
+truncate together when the band runs out of width.
 
 The turn disclosure header states the turn's outcome and carries only its bounded
 metadata: status, recorded duration and direct tool/search count. It never echoes
@@ -946,22 +958,25 @@ extra hierarchy.
 Except for the display mode's Thinking default, no item payload opens itself: a
 tool, hosted-search or plan call stays a header row until the user opens its
 disclosure, including a Bash row, whose detail stays closed until the user opens
-it. Active groups stay open; after completion, small groups (up to four visible
-items) and Task topology groups remain open, while larger ordinary groups start
-closed. With `Show thinking` on, Thinking rows expand by default in every display
-mode and collapse only on user action. An expanded Thinking row shows its full
-reasoning markdown; a collapsed one shows only the Thinking indicator, with no
-summary or excerpt. With `Show thinking` off, no completed reasoning row renders;
-only a live whole-run TextShimmer `Thinking` indicator remains while reasoning is
-actively streaming, and empty thinking-only containers are omitted. The stored
-reasoning is retained and reappears when the preference is turned back on.
+it. Groups stay open while their turn runs; after it settles, small groups (up to
+four visible items), Task topology groups and groups that still render a Thinking
+row remain open, while larger ordinary groups of plain tool rows start closed.
+With `Show thinking` on, Thinking rows expand by default in every display mode and
+collapse only on user action. An expanded Thinking row shows its full reasoning
+markdown; a collapsed one shows only the Thinking indicator, with no summary or
+excerpt. With `Show thinking` off, no completed reasoning row renders; only a live
+whole-run TextShimmer `Thinking` indicator remains while reasoning is actively
+streaming, and empty thinking-only containers are omitted. The stored reasoning is
+retained and reappears when the preference is turned back on.
 
 Group, run row and item are independent controls. Closing an ancestor keeps
 descendant choices and reopening restores them; closing the turn's disclosure hides
 every row under it, and reopening restores the groups the user had opened. Opening
-a parent never expands all children. User interaction with a child claims its
-containing group without toggling it, so completion cannot close around opened,
-focused or selected content. Choices use stable turn/group/item identities and
+a parent never expands all children. An explicit choice belongs to its own level
+alone and never pins an ancestor; reading protection is transient instead: while
+focus or a selection is inside a level, an automatic close is deferred for that
+level and its ancestors, and leaving the content hands control straight back to
+the automatic default. Choices use stable turn/group/item identities and
 remain while the retained session pane lives, including preference changes and row
 remounts; pane eviction, deletion or renderer restart reapplies defaults rather
 than persisting disclosure state to messages or settings.
@@ -980,11 +995,12 @@ pending action cards remain reachable outside a hidden process. See
 | Empty | Restrained hero + optional onboarding checklist in a scrollable content region, with a bottom-reserved home composer and no starter-card or contextual quick-action layer (D111/D204/D206). An open project underlines the project name, including before its first session exists; the control opens a searchable switcher of the sidebar's open projects, with clone-git-project and open-project actions. |
 | Streaming | Auto-scroll follows while pinned; new tokens append |
 | Active progress | Immediately after send, before the first assistant or tool event, a compact localized `Working…` status with elapsed time appears inline. Its model and subagent elapsed labels use the carried-unit format in §9.1. When the runtime names a quiet interval, that same row identifies starting, waiting for the model, preparing the next request, compacting context, recovering an empty response, retrying, or waiting for delegated work (with each running subagent's latest coarse action). It remains visible through thinking, tool execution, completed-tool gaps, and partial answers until the turn ends. Runtime phases take precedence over the Planning/Goal or Working fallback. Pending permissions, questions, and plan/goal approvals suppress the row; history reading never shows live status; no large generic progress card is rendered. The row lives in the reserved tail lane, so it appears and clears mid-turn without changing the transcript's content height. A retrying row remains compact at rest; hovering or focusing it reveals an error-styled tooltip with the localized error summary, stable code/HTTP status, and bounded provider message. The tooltip mixes the error tint over `--ds-bg-elevated-opaque` so transcript text does not show through. |
-| Turn outcome | After a failed turn, a session-scoped recovery card summarizes the interruption and tool evidence. Completed turns use the existing transcript and message-scoped review rows without an extra success card; failed turns can continue through one localized prompt without losing the transcript. |
+| Turn outcome | After a failed turn, a session-scoped recovery card summarizes the interruption and tool evidence. Completed turns use the existing transcript and message-scoped review rows without an extra success card; a completed turn that wrote workspace files also shows the per-turn changed-files summary below (D674). Failed turns can continue through one localized prompt without losing the transcript. |
 | Session switch | A first-opened session paints at its latest record; a revisited pane paints at its own retained position. Bounded first commit and full-history expansion show the same position: no post-paint height correction may shift the visible rows, in either direction |
 | Turn start (send / retry / regenerate) | Re-pins and positions the latest content before paint, even if the user had scrolled up; the later persisted user-message event does not flash the transcript at its top, and the composer collapse / indicator layout clamps during the send never release follow mode |
-| Idle (after stream) | Auto-scroll unlocked; user can scroll freely |
+| Idle (after stream) | Auto-scroll unlocked; user can scroll freely. A completed turn the user was following ends with its prompt at the top of the viewport and jump-to-latest shown, unless the prompt was already in view (D676) |
 | Message-scoped review snapshot | Each successful workspace Write/Edit renders as one tool-level review row (`ReviewChangeCard`) carrying that message's added/modified/deleted status and explicit addition/deletion totals. The row itself is the file header — Git-style status letter (`A`/`M`/`D`), path, addition/deletion counts, disclosure caret — with no separate generic tool row above it, so the file header appears exactly once. It keeps the tool-row rhythm with no card border, status rail, icon plate, or status pill; hover fill is the only row chrome, and a rolled-back change is struck through. Its hunks sit in the diff body directly beneath that header behind the row's expandable disclosure: every review row (inline and in the Review tab) is collapsed by default, and the user expands it on demand. The diff body's action row keeps hash-guarded rollback and adds Copy for the hunks. The card remains after a Git commit, never becomes a bottom/global entry, and does not leak into another session's transcript. |
+| Per-turn changed files | A completed reply (same mount condition as the reply plugin slots, so never while streaming and never after a failed turn) whose turn recorded at least one workspace review change shows one read-only `TurnChangesCard` below its answer and above `entryExtra` blocks (D674). It is built only from that turn's message-owned review records: one row per path in first-touched order, counts summed across edits, status `D` when the turn ends by deleting the file, else `A` if any edit created it, else `M`; a file whose every edit was rolled back stays listed, struck through, with the state in its accessible name. The header shows `Changes this turn`, the file count, and the summed `+`/`−`. Up to four files use relaxed 25px rows; more switch to dense 21px rows and add the directory count; rows past 12 fold into `+N more` plus a link that opens Review. The card is one `--ds-tile` surface with no border or rules. Clicking a row opens the originating session's Review tab, scrolls to that file's first recorded change, and expands its changes there — the card has no diff body or rollback of its own. A turn without workspace writes renders nothing. |
 
 ### 4.5 Accessibility
 
@@ -1134,10 +1150,12 @@ entirely inside the plugin's isolated page:
 - Selecting a file replaces the tree with a focused viewer: syntax-highlighted
   editing with save, a Markdown preview toggle, image and audio/video viewing,
   CSV/TSV tables with paging and sorting, a JSON tree, and read-only SQLite
-  browsing with a SQL query box. Binaries report that they cannot be previewed
-  rather than being decoded, and every viewer names its own bound — 2 MiB for
-  text, 8 MiB for images, 24 MiB for media, none for databases, whose bytes stay
-  out of the page.
+  browsing with a SQL query box. The editor's CodeMirror find/replace fields
+  and buttons use the plugin theme surfaces and foreground in both light and
+  dark appearances. Binaries report that they cannot be previewed rather than
+  being decoded, and every viewer names its own bound — 2 MiB for text, 8 MiB
+  for images, 24 MiB for media, none for databases, whose bytes stay out of
+  the page.
 - Saving is atomic and refuses to overwrite a file that changed on disk since it
   was opened until the user confirms. Loading, read failures, unsupported
   binaries, oversized files, empty folders, and folders that fail to load each
@@ -1166,8 +1184,8 @@ entirely inside the plugin's isolated page:
   stays hidden until its current main-frame navigation commits. Root lookup or load
   completion from a superseded request cannot navigate, reveal, or publish the
   old session as current. A session without a remembered preview stays empty;
-  closing the panel or disposing the guest wins over pending work. Normal
-  navigation within the same session retains that session's visible content.
+  collapsing the panel hides presentation without canceling owned page work.
+  Normal navigation within the same session retains that session's visible content.
   The address bar immediately shows loading feedback. A current main-frame commit
   reveals the page without waiting for images or subframes; those continue to
   drive the loading/stop control. A failed switch or one exceeding the 15-second
@@ -1195,9 +1213,16 @@ entirely inside the plugin's isolated page:
   ordinary in-page navigation stay in the current tab. Website new-window links
   follow Link open destination: another work-panel tab, or the system browser.
 
-- BrowserPreview creates its resource tab before navigating and never rewrites
-  the prior tab. A background navigation is retained for its session's selected
-  tab (or consumed once by its first tab). A new blank tab reports empty state.
+- BrowserPreview creates and loads its host-owned page before requesting its
+  side-panel resource tab; it never rewrites the prior tab. Background navigation
+  runs immediately in the calling session's connected page. A blank tab stays empty.
+- The browser stays in the side panel. Collapsing it, switching conversations,
+  navigating to Settings, unmounting chrome or reloading the shell does not stop
+  a retained page or its AI operations. Main detaches presentation on shell reload
+  and provides session-owned metadata to restore tabs without reopening the panel.
+  AI connections do not follow presentation selection once established. Unknown
+  or closed targets fail rather than borrowing the visible page. Explicit tab or
+  session close, plugin disable, window destruction and app shutdown release pages.
 
 - Main-frame same-document navigation (fragment links and History API routes) updates
   the browser address, history controls, and loading state without requiring a
@@ -1218,7 +1243,7 @@ entirely inside the plugin's isolated page:
 | Open with no resource | `Cmd/Ctrl + J` reveals the panel without creating a tab, so the body renders the New launcher. Clicking `+` creates an explicit, closable New tab with the same launcher rows. Activating a row from that tab replaces it with or selects the singleton view. Closing the final tab leaves the panel open in the no-resource state. |
 | Constrained work area | The panel is capped by the shared three-column budget inside the existing client area; MainChat never drops below its 450px floor and the expanded sidebar yields at the threshold |
 | New launcher active | The body hosts concise Review and plugin-view buttons. Each row replaces the launcher tab with its destination or activates the existing singleton; the page is independently closeable. |
-| Plugin view active | The body hosts the plugin's own isolated page as a native `WebContentsView`, positioned from the measured surface rect. It remains visible at its full rect while the divider is being resized or a New launcher tab is created; creating a page never pushes the plugin body down or changes its bounds. Embedded plugin documents start with zero root/body margin and border and a transparent background, so the host panel and plugin theme own the visible surface edge. It is hidden whenever the tab is inactive, the panel is animating, or a panel-wide blocking overlay is open — the same rule the Browser preview follows, since both composite above renderer content. A view whose plugin is disabled, uninstalled, reloaded, or crashed is destroyed; the tab stays and re-opens the page on the next lifecycle event (ADR 0104) |
+| Plugin view active | The body hosts the plugin's own isolated page as a native `WebContentsView`, positioned from the measured surface rect. It remains visible at its full rect while the divider is being resized or a New launcher tab is created; creating a page never pushes the plugin body down or changes its bounds. Embedded plugin documents start with zero root/body margin and border and a transparent background, so the host panel and plugin theme own the visible surface edge. It is hidden whenever the tab is inactive, the panel is animating, or a panel-wide blocking overlay is open. While any plugin view is active, a tab context menu uses a native popup above the `WebContentsView`; this platform styling is required by native-view z-order, while labels, ordering, and enabled actions match the renderer menu. The menu anchor follows the pointer at the current app zoom. A full main-frame navigation of the host renderer, including reload, detaches the visible native view without closing its cached page; opening the tab again reattaches the same page. Same-document and child-frame navigations keep it attached. A view whose plugin is disabled, uninstalled, reloaded, or crashed is destroyed; the tab stays and re-opens the page on the next lifecycle event (ADR 0104) |
 | Plugin out of scope | A view contributed by a plugin that is not active in the current project disappears from the New launcher when the project changes. Unlike contributed themes, which are one global setting and stay unfiltered, a view is scoped work |
 
 ### 5.4 Interactions
@@ -1249,7 +1274,9 @@ entirely inside the plugin's isolated page:
   resize the window, or change visible selection/focus. The transcript does
   not create a global Review changes launcher: each successful workspace
   Write/Edit renders only its own tool-level review row, and another session
-  cannot render that card in its transcript. Repeated resources deduplicate
+  cannot render that card in its transcript. The per-turn changed-files card
+  (D674) is scoped to one finished turn and opens Review only on a user
+  click. Repeated resources deduplicate
   within the originating session.
 - Review truth: host-core adds one bounded `details.review` record to each
   successful workspace Write/Edit result. The renderer reads that record from
@@ -1273,6 +1300,11 @@ entirely inside the plugin's isolated page:
   the strip toward off-screen tabs. `Alt+ArrowLeft`/`Alt+ArrowRight` reorders
   the focused tab without changing its active state. The `+` trigger remains
   fixed beside the strip and creates a new launcher tab.
+- Tab context menu: right-clicking a tab or invoking its context-menu key while
+  focused opens a localized menu with Close Tab, Close Other Tabs, and Close All
+  Tabs. Close Other Tabs keeps and activates the pointed-to tab and is disabled
+  when it is the only tab. Close All Tabs releases Browser pages, empties the
+  strip, and leaves the panel open on the New launcher.
 - New launcher: each `+` click creates a unique, active New tab. Its body uses
   the Review-plus-plugin tool list as buttons. Selecting a row replaces the
   launcher tab with that destination or activates its existing singleton.
@@ -1335,6 +1367,8 @@ entirely inside the plugin's isolated page:
   `aria-controls`, roving `tabIndex`, and localized close buttons.
   ArrowLeft/ArrowRight/Home/End move through tabs; Delete/Backspace and
   middle-click close the focused tab. The `+` button is a direct action with a
+  Right-click, Shift+F10, or the context-menu key on a focused tab opens a
+  localized `role="menu"` with the shared arrow/Enter/Escape navigation.
   localized label and no popup state. A New tab's body is a labelled
   `role="tabpanel"` containing a labelled `role="group"` of ordinary buttons;
   the legacy no-tab reveal remains a plain labelled group. Each resource body
@@ -1614,6 +1648,7 @@ storage but compose into one assistant turn until the next user message.
 | Session transition | A warm destination pane is revealed immediately with its retained content and position. If it is running or still holds a not-yet-flushed completed reply, its live renderer snapshot survives the durable revalidation read. A cold destination leaves the visible pane on its own session under a thin progress track until it commits; nothing is dimmed, hidden panes stay mounted and inert, and current stream updates are not deferred |
 | Streaming | New tokens append; auto-scroll only while pinned to bottom |
 | Turn start | Send / retry / regenerate re-pins follow mode and jumps to bottom |
+| Turn completion | A completed turn the user followed scrolls its prompt to the top and releases follow mode; failed, aborted, short, and manually scrolled turns keep their position (D676) |
 | Thinking-only streaming | Transcript opens; the latest thinking disclosure opens unless the user has taken it over; no empty answer bubble; the tail status continues to identify the running turn |
 | Running fallback | Compact animated-dot Working row throughout the running turn when no specific runtime phase or planning state is known, including pauses after partial output or completed tools |
 | Running planning | Compact animated-dot Planning / Goal row in that same slot throughout the planning turn; a runtime phase takes precedence, and pending user interaction or turn completion hides it. The Composer mode chip pulses |
@@ -3168,6 +3203,8 @@ reasoning-level control.
   it does not request `agent/stop`. `TaskWait` yields without canceling delegates.
   Refused input or an input with a different effective permission mode retains
   its durable queue entry until the next turn. When idle it starts immediately.
+  With the composer empty, the steering shortcut promotes the first waiting row
+  the same way, skipping rows that are still saving or already promoted.
 - A pending queue row is locked until Host admission returns its durable id: move
   up/down, Send now, edit, and remove are disabled. All five tooltips explain
   that it is saving; Send now also displays the localized Saving label. Direct edit/remove actions leave the pending row and draft

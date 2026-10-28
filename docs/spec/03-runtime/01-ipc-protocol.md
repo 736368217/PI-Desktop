@@ -1858,8 +1858,8 @@ through `session.get`, allowing its project-group folders (or its isolated
 worktree) and its own `<data_dir>/scratch/<sessionId>` directory. A temporary
 conversation needs no workspace to preview its generated HTML. A missing
 session fails explicitly; a background preview never inherits the visible
-session's roots. BrowserPreview validates realpath containment before emitting
-the absolute path to the existing resource-tab owner. Chat links to other
+session's roots. BrowserPreview validates realpath containment before creating
+its host-owned page and emitting the corresponding resource-tab identity.
 sessions' scratch files and attachments retain the read-only file surface.
 This does not restrict the Browser's explicit absolute-path / `file:` address
 entry or local-page navigation, which follow its existing local-file policy.
@@ -1889,12 +1889,15 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
   tab id is supplied). The shared plugin chrome is not closed with a sibling page.
 - event: `browser/event/state {url, title, isLoading, canGoBack, canGoForward, loadError?, sessionId?, tabId?}`
   (also pushed to plugin views as `browser:state`)
-- agent preview event: `browser/event/preview {sessionId, path?, url?}`.
-  Electron Main validates a workspace `path` inside that session's project,
-  asks the renderer to create a Browser resource tab before navigation, with
-  `location` in the matching
-  runtime panel context. Navigation of a background session does not steal the
-  visible guest.
+- `browser/getPages({sessionId})` → `BrowserState[]`. Returns only that session's
+  retained page metadata for shell-reload recovery, including blank/loading tabs.
+  It never returns DOM, credentials, another session's pages or shared plugin state.
+- agent preview event: `browser/event/preview {sessionId, tabId?, path?, url?, revealOnly?}`.
+  Electron Main validates a workspace `path`, starts its own resource page and
+  requests the corresponding renderer tab. Page execution does not wait for UI
+  mounting. Continuing operations use a trusted session connection rather than
+  visible selection. Explicit reveal remains presentation-only; background work
+  never steals focus. Shell reload hides presentation without destroying pages.
 - plugin file action: `browser/event/openFile {path}`. Electron Main emits this
   only after the plugin's `fs.openInBrowser` request passes its declared
   `fs.read` scope and HTML-file checks. The renderer opens the absolute path in a
@@ -2010,6 +2013,33 @@ type NativeMenuAction =
 menu/nativeAction({ action: NativeMenuAction })
   -> { maximized: boolean; fullScreen: boolean }
 ```
+
+When a plugin-contributed `WebContentsView` is active, the renderer sends tab
+context-menu labels and its pointer anchor through one bounded Main-owned
+channel. Main validates the payload, scales CSS coordinates by the sender's
+current zoom factor, clamps them to the window content area, and builds only
+the fixed close actions. The result is the selected action or `null` on cancel
+or window close; the renderer rechecks the session and target tab after this
+async boundary:
+
+```ts
+type WorkPanelTabMenuAction = "closeTab" | "closeOtherTabs" | "closeAllTabs";
+type WorkPanelTabMenuRequest = {
+  closeTabLabel: string;
+  closeOtherTabsLabel: string;
+  closeAllTabsLabel: string;
+  canCloseOthers: boolean;
+  x: number; // renderer CSS pixels
+  y: number; // renderer CSS pixels
+};
+
+workPanel/tabMenu(request: WorkPanelTabMenuRequest)
+  -> WorkPanelTabMenuAction | null
+```
+
+Labels are presentation-only; they cannot select an arbitrary Main action.
+The OS-native menu appearance is a z-order requirement so the menu stays
+above the native view.
 
 Developer tools use a dedicated Main-owned gate rather than a generic native
 menu action:
@@ -2202,6 +2232,10 @@ cache cold so the next submit retries the read; a warm cache keeps resolving
 through a source blip.
 
 ### fs/index
+
+Git listings are decoded as a continuous UTF-8 stream. File names, including
+non-ASCII characters split across process output chunks, retain their exact
+spelling in both the index and `fs/search` results.
 
 ```ts
 fs/index() -> { entries: FsIndexEntry[]; truncated: boolean }
@@ -2503,6 +2537,13 @@ startup failure is logged and does not prevent the desktop from launching.
 | `INTERNAL` | Uncategorized internal error |
 
 ## Native Pi session routing (ADR 0254)
+
+The Electron `pi-desktop/session/list` response also includes
+`runningSessionIds`, a snapshot of the Desktop turns still owned by Main after
+the list reads settle. A recreated renderer restores these running flags during
+bootstrap; start/end events already received by that renderer take precedence.
+An older response without this field remains valid. Historical completion
+notifications are not evidence that a currently active turn has finished.
 
 `pi-desktop/session/list` returns both Desktop and native summaries. Each summary
 may carry `source: "desktop" | "pi-native"`, capability flags, and a stable

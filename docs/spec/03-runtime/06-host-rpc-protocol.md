@@ -1,5 +1,33 @@
 # 06. Host RPC Protocol
 
+
+### Bounded existing-history operations (#1868)
+
+The Desktop uses additive Host methods for existing history: `session.deleteMessage`
+takes `sessionId/messageId` and returns `ok/deleted/deletedCount`;
+`session.retractPendingPrompt` takes `sessionId/userMessageId` and optional
+`turnId`, returning `ok/retracted/removedCount` and a refusal `reason` when needed.
+Host verifies canonical message/turn ownership and meaningful reply activity;
+a refused retract leaves history intact. Repeating an already completed deletion
+or retraction does not delete another prompt. No history array is required.
+
+`session.activateRevision` accepts optional `requireCanonicalPrefix: true` to
+require a durable Host prefix; a missing family/anchor fails explicitly. Existing
+explicit-prefix activation, `session.replaceMessages`, `session.saveRevision`
+and their original request/response forms remain supported. Existing edit and
+regenerate continue using `session.truncateFrom`; branch archival and fork
+remain Host-owned. Oversized local requests report the method and UTF-8 byte count without payload
+content; the caller sees a local-transport explanation and the existing session
+Fork recovery path. No identical oversized payload is retried.
+The unchanged 64 MiB limit still applies to arbitrary incoming
+requests, including a genuinely oversized single tool result.
+
+ID mutations use the same session operation lock, rewrite fence and runtime
+disposal boundary. Their outbox drain must confirm all target-session entries
+were written; failure preserves the queue and rejects the mutation. Smart-stop
+restores a draft only after Host confirmation, and exposes failures.
+
+
 ## 1. Goal
 
 Define the local protocol between:
@@ -337,6 +365,20 @@ to later refresh and inference; the vendor picker does not collect them.
   branch (discarding unmerged work)
 - `session.getScratchPath` — the session's scratch directory (D114), created
   on demand
+- `visualizations.readFragment({ sessionId, fileName })` — private Main-to-Host
+  reader for `pi-genui:` documents (D671). No renderer IPC or Plugin SDK method
+  is added. Parameters contain only a validated session ID and direct `.html`
+  basename; caller-supplied roots and extra fields are rejected. Host resolves
+  against its current data directory and pins native directory capabilities:
+  Unix uses relative `openat` with no-follow/nonblocking flags; Windows uses
+  `NtCreateFile` with a pinned `RootDirectory` for every ancestor/owned child
+  and refuses opened reparse entries. Share masks are an extra defense, not a
+  substitute for relative capabilities. Returns `{ ok: true, base64 }` for at
+  most 2 MiB of file bytes, or
+  `{ ok: false, code: "not-found" | "too-large" }`. Main validates this payload,
+  decodes bytes, rejects full HTML documents, and supplies the response sandbox.
+  Filesystem work does not hold the state/database lock. Additive to v11; no
+  storage schema change.
 - `session.rename({ id, title })` trims and validates the title at the host
   boundary. It accepts 1–80 Unicode code points and returns `{ ok: boolean }`;
   blank or overlong titles are `INVALID_PARAMS`. A successful rename changes
@@ -690,6 +732,15 @@ lifecycle invalidation, not a high-volume log transport. Clients fetch only the
 selected output preview. A terminal snapshot includes the final drained output,
 and shutdown signals every registered task even during a concurrent output read.
 
+`backgroundTasks.list` stays session-agnostic: it returns every task in the
+registry, each carrying its `sessionId`, and the renderer filters to the session
+on screen. Filtering is presentation, so the wire contract does not grow a
+session parameter and no consumer loses visibility of other sessions' work.
+Deleting a session signals its running tasks host-side; the deletion path does
+not wait for them to settle and does not fail when one cannot be killed.
+Removing a row in the UI is purely a view action and issues no RPC, so a removed
+task's output remains readable by id until the host's own retention drops it.
+
 ### Shells
 - `commandShells.list`
 - `settings.set` with a partial settings object; omitted fields are preserved,
@@ -768,7 +819,11 @@ against a live host, and replaying one after the final row would be wrong.
   deletes the stored key. Returns `{ provider }`, or `null` for an unknown id
 - `providers.getSecret` — main/host only, never reachable from the renderer
 - `providers.listModels` / `providers.cacheModels` — discovered model rows
-  and their host-side cache (ADR 0027 / ADR 0134)
+  and their host-side cache (ADR 0027 / ADR 0134). `cacheModels` accepts optional
+  `complete` (default false). Model rows expose optional `discoveryState`
+  (`published` / `unlisted`); omission is unknown. Only complete, nonempty
+  snapshots reconcile missing discovered rows, without changing configuration.
+  See provider-config schema for the conservative refresh and consumer rules.
 - `providers.testConnection`
 
 ### Agent capabilities (skills, subagents, MCP servers)
