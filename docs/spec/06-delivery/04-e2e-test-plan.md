@@ -18573,7 +18573,6 @@ host-created files. The full app's file-preview viewer is covered separately.
   6. Toggle "Available for AI delegation" in the first service's own model
      dialog and return to the Models page.
 - **Expected**: The row lists exactly the opted-in models as `provider · model`
-- **Expected**: The row lists exactly the opted-in models as `provider · model`
   and shows its empty-state line when none is opted in; a model joins the list
   only through that editor's tick. Adding writes
   `availableForSubagents` on that service's binding and the next parent turn
@@ -18581,7 +18580,6 @@ host-created files. The full app's file-preview viewer is covered separately.
   catalog and leaves no `false` behind on the stored binding. A service that is
   off or holds no credential keeps its listed models visible and removable,
   annotated with the reason they are idle, while its models stay out of the
-  catalog.
   catalog. The provider dialog and the row show the same flag in both
   directions, so neither surface can drift. A plugin-owned service row renders
   read-only. The row is hidden while no service has a configured model, and a
